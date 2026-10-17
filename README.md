@@ -334,6 +334,10 @@ Multiple VMs can be connected to a single `socket_vmnet` instance.
 
 Make sure to specify unique MAC addresses to VMs: `-device virtio-net-pci,netdev=net0,mac=de:ad:be:ef:00:01` .
 
+`socket_vmnet` forwards frames like a learning switch: it remembers which VM, or the host side, each MAC address was last seen on and sends unicast frames only there.
+Broadcast, multicast and frames to MAC addresses it has not seen yet go to every VM.
+A MAC address is forgotten after 300 seconds without traffic, or when its VM disconnects; at most 8,192 are remembered, as in Open vSwitch.
+
 NOTE: don't confuse MAC addresses of VMs with the MAC address of `socket_vmnet` itself that is printed as `vmnet_mac_address` in the debug log.
 You do not need to configure (and you can't, currently) the MAC address of `socket_vmnet` itself.
 

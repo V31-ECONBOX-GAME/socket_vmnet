@@ -69,4 +69,3 @@ jobs:
           fix: true # Enabled to improve reported errors
           globs: '**/*.md'
           config: '.markdownlint.json'
-          

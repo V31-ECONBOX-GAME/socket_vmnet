@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <grp.h>
+#include <net/ethernet.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
@@ -12,10 +13,12 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 #include <vmnet/vmnet.h>
 
 #include "cli.h"
+#include "fdb.h"
 #include "log.h"
 
 #if __MAC_OS_X_VERSION_MAX_ALLOWED < 101500
@@ -73,7 +76,6 @@ static void print_vmnet_start_param(xpc_object_t param) {
 }
 
 struct conn {
-  // TODO: uint8_t mac[6];
   int socket_fd;
   struct conn *next;
 } _conn;
@@ -83,10 +85,20 @@ struct state {
   dispatch_queue_t vms_queue;
   dispatch_queue_t host_queue;
   struct conn *conns; // TODO: avoid O(N) lookup
+  struct fdb *fdb;
 } _state;
 
-static void state_add_socket_fd(struct state *state, int socket_fd) {
+// The fdb port of frames coming from vmnet; VM ports are their struct conn.
+static const char host_port;
+
+static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC); }
+
+static struct conn *state_add_socket_fd(struct state *state, int socket_fd) {
   struct conn *conn = calloc(1, sizeof(*conn));
+  if (conn == NULL) {
+    ERRORN("calloc");
+    return NULL;
+  }
   conn->socket_fd = socket_fd;
   dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
   if (state->conns == NULL) {
@@ -98,6 +110,7 @@ static void state_add_socket_fd(struct state *state, int socket_fd) {
     last->next = conn;
   }
   dispatch_semaphore_signal(state->sem);
+  return conn;
 }
 
 static void state_remove_socket_fd(struct state *state, int socket_fd) {
@@ -116,6 +129,31 @@ static void state_remove_socket_fd(struct state *state, int socket_fd) {
     }
   }
   dispatch_semaphore_signal(state->sem);
+}
+
+static void send_to_vm(const struct conn *conn, const void *frame, uint32_t len) {
+  uint32_t header_be = htonl(len);
+  struct iovec iov[2] = {
+      {.iov_base = &header_be,    .iov_len = 4  },
+      {.iov_base = (void *)frame, .iov_len = len},
+  };
+  ssize_t written = writev(conn->socket_fd, iov, 2);
+  DEBUGF("Sent to the socket %d: %ld bytes (including uint32be header)", conn->socket_fd, written);
+  if (written < 0) {
+    ERRORN("writev");
+  }
+}
+
+// Sends a frame to every VM except the one it came from (NULL when it came from vmnet).
+static void flood_to_vms(struct state *state, const struct conn *from, const void *frame,
+                         uint32_t len) {
+  dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
+  struct conn *conns = state->conns;
+  dispatch_semaphore_signal(state->sem);
+  for (struct conn *conn = conns; conn != NULL; conn = conn->next) {
+    if (conn != from)
+      send_to_vm(conn, frame, len);
+  }
 }
 
 static void _on_vmnet_packets_available(interface_ref iface, int64_t buf_count, int64_t max_bytes,
@@ -154,43 +192,26 @@ static void _on_vmnet_packets_available(interface_ref iface, int64_t buf_count, 
   DEBUGF("Received from VMNET: %d packets (buffer was prepared for %lld packets)", received_count,
          buf_count);
   for (int i = 0; i < received_count; i++) {
-    uint8_t dest_mac[6], src_mac[6];
-    assert(pdv[i].vm_pkt_iov[0].iov_len > 12);
-    const char *packet = (const char *)pdv[i].vm_pkt_iov[0].iov_base;
-    memcpy(dest_mac, packet, sizeof(dest_mac));
-    memcpy(src_mac, packet + 6, sizeof(src_mac));
+    const uint8_t *frame = pdv[i].vm_pkt_iov[0].iov_base;
+    uint32_t len = pdv[i].vm_pkt_size; // not vm_pkt_iov[0].iov_len
+    if (len < ETHER_HDR_LEN) {
+      flood_to_vms(state, NULL, frame, len);
+      continue;
+    }
+    const uint8_t *dest_mac = frame, *src_mac = frame + ETHER_ADDR_LEN;
     DEBUGF("[Handler i=%d] Dest %02X:%02X:%02X:%02X:%02X:%02X, Src "
            "%02X:%02X:%02X:%02X:%02X:%02X,",
            i, dest_mac[0], dest_mac[1], dest_mac[2], dest_mac[3], dest_mac[4], dest_mac[5],
            src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
-    dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
-    struct conn *conns = state->conns;
-    dispatch_semaphore_signal(state->sem);
-    for (struct conn *conn = conns; conn != NULL; conn = conn->next) {
-      // FIXME: avoid flooding
-      DEBUGF("[Handler i=%d] Sending to the socket %d: 4 + %ld bytes [Dest "
-             "%02X:%02X:%02X:%02X:%02X:%02X]",
-             i, conn->socket_fd, pdv[i].vm_pkt_size, dest_mac[0], dest_mac[1], dest_mac[2],
-             dest_mac[3], dest_mac[4], dest_mac[5]);
-      uint32_t header_be = htonl(pdv[i].vm_pkt_size);
-      struct iovec iov[2] = {
-          {
-           .iov_base = &header_be,
-           .iov_len = 4,
-           },
-          {
-           .iov_base = pdv[i].vm_pkt_iov[0].iov_base,
-           .iov_len = pdv[i].vm_pkt_size, // not vm_pkt_iov[0].iov_len
-          },
-      };
-      ssize_t written = writev(conn->socket_fd, iov, 2);
-      DEBUGF("[Handler i=%d] Sent to the socket: %ld bytes (including uint32be "
-             "header)",
-             i, written);
-      if (written < 0) {
-        ERRORN("writev");
-        goto done;
-      }
+    uint64_t now = now_ns();
+    fdb_learn(state->fdb, src_mac, &host_port, now);
+    const struct conn *to = fdb_lookup(state->fdb, dest_mac, now);
+    if (to == NULL) {
+      flood_to_vms(state, NULL, frame, len);
+    } else if ((const void *)to != &host_port) {
+      send_to_vm(to, frame, len);
+    } else {
+      DEBUGF("[Handler i=%d] Dropping a frame for the host side", i);
     }
   }
 done:
@@ -543,6 +564,13 @@ int main(int argc, char *argv[]) {
 
   state.sem = dispatch_semaphore_create(1);
 
+  // Not destroyed on exit: VM handlers may still be running.
+  state.fdb = fdb_create(&host_port);
+  if (state.fdb == NULL) {
+    ERRORN("fdb_create");
+    goto done;
+  }
+
   // Queue for vm connections, allowing processing vms requests in parallel.
   state.vms_queue =
       dispatch_queue_create("io.github.lima-vm.socket_vmnet.vms", DISPATCH_QUEUE_CONCURRENT);
@@ -612,9 +640,13 @@ done:
 
 static void on_accept(struct state *state, int accept_fd, interface_ref iface) {
   INFOF("Accepted a connection (fd %d)", accept_fd);
-  state_add_socket_fd(state, accept_fd);
+  void *buf = NULL;
+  struct conn *conn = state_add_socket_fd(state, accept_fd);
+  if (conn == NULL) {
+    goto done;
+  }
   size_t buf_len = 64 * 1024;
-  void *buf = malloc(buf_len);
+  buf = malloc(buf_len);
   if (buf == NULL) {
     ERRORN("malloc");
     goto done;
@@ -647,6 +679,24 @@ static void on_accept(struct state *state, int accept_fd, interface_ref iface) {
     assert(received == header);
     DEBUGF("[Socket-to-VMNET i=%lld] Received from the socket %d: %ld bytes", i, accept_fd,
            received);
+
+    const struct conn *to = NULL;
+    if (header >= ETHER_HDR_LEN) {
+      uint64_t now = now_ns();
+      fdb_learn(state->fdb, (const uint8_t *)buf + ETHER_ADDR_LEN, conn, now);
+      to = fdb_lookup(state->fdb, buf, now);
+    }
+    if (to == conn) {
+      DEBUGF("[Socket-to-VMNET i=%lld] Dropping a frame for the sender itself", i);
+      continue;
+    }
+    if (to != NULL && (const void *)to != &host_port) {
+      DEBUGF("[Socket-to-Socket i=%lld] Sending from socket %d to socket %d: 4 + %d bytes", i,
+             accept_fd, to->socket_fd, header);
+      send_to_vm(to, buf, header);
+      continue;
+    }
+
     struct iovec iov = {
         .iov_base = buf,
         .iov_len = header,
@@ -666,41 +716,20 @@ static void on_accept(struct state *state, int accept_fd, interface_ref iface) {
     }
     DEBUGF("[Socket-to-VMNET i=%lld] Sent to VMNET: %ld bytes", i, pd.vm_pkt_size);
 
-    // Flood the packet to other VMs in the same network too.
-    // (Not handled by vmnet)
-    // FIXME: avoid flooding
-    dispatch_semaphore_wait(state->sem, DISPATCH_TIME_FOREVER);
-    struct conn *conns = state->conns;
-    dispatch_semaphore_signal(state->sem);
-    for (struct conn *conn = conns; conn != NULL; conn = conn->next) {
-      if (conn->socket_fd == accept_fd)
-        continue;
-      DEBUGF("[Socket-to-Socket i=%lld] Sending from socket %d to socket %d: "
-             "4 + %d bytes",
-             i, accept_fd, conn->socket_fd, header);
-      struct iovec iov[2] = {
-          {
-           .iov_base = &header_be,
-           .iov_len = 4,
-           },
-          {
-           .iov_base = buf,
-           .iov_len = header,
-           },
-      };
-      ssize_t written = writev(conn->socket_fd, iov, 2);
-      DEBUGF("[Socket-to-Socket i=%lld] Sent from socket %d to socket %d: %ld "
-             "bytes (including uint32be header)",
-             i, accept_fd, conn->socket_fd, written);
-      if (written < 0) {
-        ERRORN("writev");
-        continue;
-      }
+    // Broadcast, multicast and unlearned destinations also go to the other VMs, as vmnet does
+    // not deliver them there.
+    if (to == NULL) {
+      DEBUGF("[Socket-to-Socket i=%lld] Flooding from socket %d: 4 + %d bytes", i, accept_fd,
+             header);
+      flood_to_vms(state, conn, buf, header);
     }
   }
 done:
   INFOF("Closing a connection (fd %d)", accept_fd);
   state_remove_socket_fd(state, accept_fd);
+  if (conn != NULL) {
+    fdb_forget_port(state->fdb, conn);
+  }
   close(accept_fd);
   if (buf != NULL) {
     free(buf);

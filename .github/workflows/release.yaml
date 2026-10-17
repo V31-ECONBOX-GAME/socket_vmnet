@@ -63,8 +63,8 @@ jobs:
 
           The [GitHub Artifact Attestations](https://cli.github.com/manual/gh_attestation_verify) can be verified by running:
           \`\`\`
-          gh attestation verify socket_vmnet-${version}-arm64.tar.gz --owner lima-vm
-          gh attestation verify socket_vmnet-${version}-x86_64.tar.gz --owner lima-vm
+          gh attestation verify socket_vmnet-${version}-arm64.tar.gz --owner ${{ github.repository_owner }}
+          gh attestation verify socket_vmnet-${version}-x86_64.tar.gz --owner ${{ github.repository_owner }}
           \`\`\`
           EOF
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
