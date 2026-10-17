@@ -1,0 +1,51 @@
+name: QEMU
+
+on:
+  push:
+    branches:
+      - master
+      - 'release/**'
+  pull_request:
+  schedule:
+    - cron: '0 0 * * *'  # Runs every night at midnight UTC
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Integration tests
+    strategy:
+      fail-fast: false
+      matrix:
+        # We run on standard arm64 runners since this test is very quick.
+        platform:
+          - macos-14
+          - macos-15
+          - macos-15-intel
+          - macos-26
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Show host info
+        run: |
+          uname -a
+          sw_vers
+          ifconfig
+      - name: Build
+        run: |
+          make
+          sudo make install
+      - name: Print launchd status (shared mode)
+        run: launchctl print system/io.github.lima-vm.socket_vmnet
+      - name: Install test dependencies
+        run: |
+          brew install qemu bash
+      - name: Test (shared mode)
+        run: ./test/test.sh /var/run/socket_vmnet
+      - name: Test (disable DHCP, macOS 26+)
+        run: ./test/test-disable-dhcp.sh
+      # Bridged mode cannot be tested on GHA
